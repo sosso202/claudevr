@@ -132,6 +132,8 @@ class VrRenderer(private val act: MainActivity, private val screenWidthMm: Float
 
     private var lastTime = 0L
     private var lastStatus = ""
+    private var hasPose = false
+    private var lastTracked = 0L
 
     // Viewer lens: distortion coefficients and inter-lens distance (Cardboard-style).
     private val k1 = 0.22f
@@ -240,10 +242,14 @@ class VrRenderer(private val act: MainActivity, private val screenWidthMm: Float
             cam.getProjectionMatrix(proj, 0, 0.05f, 100f)
             cam.getViewMatrix(view, 0)
             update(frame, cam, s, dt, now)
+            hasPose = true
+            lastTracked = now
         } else {
             taps.set(0)
         }
-        updateStatus(tracking)
+        // Brief tracking drops keep the scene (with the last pose); only long ones show the hint.
+        updateStatus(tracking || (hasPose && now - lastTracked < 2000))
+        val drawScene = hasPose
 
         if (stereo) {
             ensureFbo(eyeW, h)
@@ -252,14 +258,14 @@ class VrRenderer(private val act: MainActivity, private val screenWidthMm: Float
                 GLES20.glViewport(0, 0, eyeW, h)
                 GLES20.glClearColor(0f, 0f, 0f, 1f)
                 GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
-                drawEye(eye, tracking)
+                drawEye(eye, drawScene)
                 GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
                 GLES20.glViewport(eye * eyeW, 0, eyeW, h)
                 drawDistortion(eye)
             }
         } else {
             GLES20.glViewport(0, 0, w, h)
-            drawEye(-1, tracking)
+            drawEye(-1, drawScene)
         }
     }
 

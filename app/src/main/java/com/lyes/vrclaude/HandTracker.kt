@@ -6,6 +6,7 @@ import android.opengl.Matrix
 import android.os.SystemClock
 import android.util.Log
 import com.google.ar.core.Camera
+import com.google.ar.core.Coordinates2d
 import com.google.ar.core.Frame
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
@@ -97,20 +98,29 @@ class HandTracker(context: Context) {
         }
         image.close()
 
+        // Map camera-image pixels to the on-screen view (NDC) the way ARCore crops and
+        // rotates it, so the hand lines up with the passthrough picture. Three points give
+        // an affine map: ndc = o + u * ax + v * ay.
+        val src = GlUtil.floatBuffer(floatArrayOf(0f, 0f, w.toFloat(), 0f, 0f, h.toFloat()))
+        val dst = GlUtil.floatBuffer(6)
+        try {
+            frame.transformCoordinates2d(Coordinates2d.IMAGE_PIXELS, src, Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES, dst)
+        } catch (e: Exception) {
+            busy.set(false); return
+        }
+        val map = FloatArray(6)
+        map[0] = dst.get(0); map[1] = dst.get(1)                    // origin
+        map[2] = (dst.get(2) - map[0]) / w; map[3] = (dst.get(3) - map[1]) / w  // per +u pixel
+        map[4] = (dst.get(4) - map[0]) / h; map[5] = (dst.get(5) - map[1]) / h  // per +v pixel
+
+        val proj = FloatArray(16)
+        camera.getProjectionMatrix(proj, 0, 0.05f, 100f)
         val pose = FloatArray(16)
-        camera.pose.toMatrix(pose, 0)
-        val intr = camera.imageIntrinsics
-        val dims = intr.imageDimensions
-        val sx = if (dims[0] > 0) w.toFloat() / dims[0] else 1f
-        val sy = if (dims[1] > 0) h.toFloat() / dims[1] else 1f
-        val fx = intr.focalLength[0] * sx
-        val fy = intr.focalLength[1] * sy
-        val cx = intr.principalPoint[0] * sx
-        val cy = intr.principalPoint[1] * sy
+        camera.displayOrientedPose.toMatrix(pose, 0)
 
         exec.execute {
             try {
-                process(w, h, yRow, uvRow, uvPix, pose, fx, fy, cx, cy)
+                process(w, h, yRow, uvRow, uvPix, pose, proj, map)
             } catch (t: Throwable) {
                 Log.w(TAG, "Hand processing failed", t)
                 error = t.message ?: t.toString()
@@ -130,7 +140,7 @@ class HandTracker(context: Context) {
 
     private fun process(
         w: Int, h: Int, yRow: Int, uvRow: Int, uvPix: Int,
-        pose: FloatArray, fx: Float, fy: Float, cx: Float, cy: Float
+        pose: FloatArray, proj: FloatArray, map: FloatArray
     ) {
         val lm = landmarker ?: return
         // Half-resolution RGB conversion: the model works at ~224 px anyway.
@@ -169,22 +179,31 @@ class HandTracker(context: Context) {
         val l = hands[0]
         if (l.size < 21) return
 
-        // Pixel coordinates in the full-resolution CPU image.
-        val px = FloatArray(21) { l[it].x() * w }
-        val py = FloatArray(21) { l[it].y() * h }
-        fun d2(a: Int, b: Int) = hypot(px[a] - px[b], py[a] - py[b])
+        // Each landmark as a view-space direction (tangent of the angle), through the
+        // same crop and projection the passthrough uses.
+        val tx = FloatArray(21); val ty = FloatArray(21)
+        for (k in 0 until 21) {
+            val u = l[k].x() * w; val v = l[k].y() * h
+            val nx = map[0] + u * map[2] + v * map[4]
+            val ny = map[1] + u * map[3] + v * map[5]
+            tx[k] = (nx + proj[8]) / proj[0]
+            ty[k] = (ny + proj[9]) / proj[5]
+        }
+        fun d2(a: Int, b: Int) = hypot(tx[a] - tx[b], ty[a] - ty[b])
 
-        val palm = max(d2(5, 17), 1f)        // index MCP to pinky MCP, ~7 cm
-        val length = max(d2(0, 9), 1f)       // wrist to middle MCP, ~9 cm
-        val z0 = min(fx * 0.07f / palm, fx * 0.09f / length).coerceIn(0.12f, 1.2f)
+        val palm = max(d2(5, 17), 1e-4f)     // index MCP to pinky MCP, ~7 cm
+        val length = max(d2(0, 9), 1e-4f)    // wrist to middle MCP, ~9 cm
+        val z0 = min(0.07f / palm, 0.09f / length).coerceIn(0.12f, 1.2f)
+        // Tangent units per image pixel, to scale MediaPipe's relative depth.
+        val tanPerPx = hypot(map[2] / proj[0], map[3] / proj[5])
 
         val pts = Array(21) { FloatArray(3) }
         val cam = FloatArray(4)
         val world = FloatArray(4)
         for (k in 0 until 21) {
-            val z = (z0 + l[k].z() * w * z0 / fx).coerceAtLeast(0.08f)
-            cam[0] = (px[k] - cx) / fx * z
-            cam[1] = -(py[k] - cy) / fy * z
+            val z = (z0 + l[k].z() * w * tanPerPx * z0).coerceAtLeast(0.08f)
+            cam[0] = tx[k] * z
+            cam[1] = ty[k] * z
             cam[2] = -z
             cam[3] = 1f
             Matrix.multiplyMV(world, 0, pose, 0, cam, 0)
