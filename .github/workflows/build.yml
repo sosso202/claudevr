@@ -1,1 +1,104 @@
-yes
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARDBOARD_COMMIT: 8bd424da7f1e399255a1b6e7c02be8e281ecc974
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # Web uploads flatten folders, so put every file where Gradle expects it.
+      - name: Arrange project files
+        run: |
+          SRC=app/src/main/java/com/lyes/vrclaude
+          mkdir -p $SRC
+          for f in MainActivity.kt VrRenderer.kt HandTracker.kt GlUtil.kt; do
+            [ -f "$f" ] && mv -f "$f" $SRC/
+          done
+          [ -f AndroidManifest.xml ] && mv -f AndroidManifest.xml app/src/main/
+          [ -f CMakeLists.txt ] && mv -f CMakeLists.txt app/
+          [ -f vrclaude.keystore ] && mv -f vrclaude.keystore app/
+          # The app's build file has an android {} block; the root one only lists plugins.
+          if grep -q "namespace" build.gradle.kts; then mv -f build.gradle.kts app/build.gradle.kts; fi
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          EOF
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "VRClaude"
+          include(":app")
+          EOF
+          printf 'org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8\nandroid.useAndroidX=true\n' > gradle.properties
+          find . -path ./.git -prune -o -type f -print | sort
+
+      - name: Get Cardboard SDK source
+        run: |
+          mkdir cardboard && cd cardboard
+          git init -q
+          git remote add origin https://github.com/googlevr/cardboard.git
+          git fetch -q --depth 1 origin $CARDBOARD_COMMIT
+          git checkout -q FETCH_HEAD
+
+      - name: Build Cardboard SDK (AAR)
+        working-directory: cardboard
+        run: |
+          echo "include ':sdk'" > settings.gradle
+          chmod +x gradlew
+          ./gradlew :sdk:assembleDebug --no-daemon --stacktrace
+
+      - name: Hand the SDK to the app
+        run: |
+          mkdir -p app/libs
+          cp cardboard/sdk/build/outputs/aar/sdk-debug.aar app/libs/cardboard-sdk.aar
+          unzip -q -o app/libs/cardboard-sdk.aar "jni/*" -d app/libs
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Download hand tracking model
+        run: |
+          mkdir -p app/src/main/assets
+          curl -fL -o app/src/main/assets/hand_landmarker.task \
+            https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
+
+      - name: Build app
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Rename APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk VRClaude.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VRClaude-apk
+          path: VRClaude.apk
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: VRClaude build ${{ github.run_number }}
+          files: VRClaude.apk
