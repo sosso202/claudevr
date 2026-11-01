@@ -82,9 +82,14 @@ class VrRenderer(private val act: MainActivity, private val screenWidthMm: Float
     private val panelDir = FloatArray(3)   // horizontal, from user to panel
     private val panelRight = FloatArray(3)
     private var hovered = -1
-    private val btnW = 0.22f
-    private val btnH = 0.07f
-    private val btnX = floatArrayOf(-0.36f, -0.12f, 0.12f, 0.36f)
+    private val btnW = 0.28f
+    private val btnH = 0.10f
+    private val btnX = floatArrayOf(-0.15f, 0.15f, -0.15f, 0.15f)
+    private val btnY = floatArrayOf(0.06f, 0.06f, -0.06f, -0.06f)
+    private var awaySince = 0L
+    private var hoverStart = 0L
+    private var dwellDone = false
+    private var dwell = 0f
     private val btnTex = IntArray(4)
     private var labelsDirty = true
 
@@ -241,6 +246,7 @@ class VrRenderer(private val act: MainActivity, private val screenWidthMm: Float
             hands.submit(frame, cam)
             cam.getProjectionMatrix(proj, 0, 0.05f, 100f)
             cam.getViewMatrix(view, 0)
+            if (hasPose && now - lastTracked > 1000) recenterRequest = true // world may have shifted
             update(frame, cam, s, dt, now)
             hasPose = true
             lastTracked = now
@@ -249,7 +255,7 @@ class VrRenderer(private val act: MainActivity, private val screenWidthMm: Float
         }
         // Brief tracking drops keep the scene (with the last pose); only long ones show the hint.
         updateStatus(tracking || (hasPose && now - lastTracked < 2000))
-        val drawScene = hasPose
+        val drawScene = tracking
 
         if (stereo) {
             ensureFbo(eyeW, h)
@@ -292,10 +298,16 @@ class VrRenderer(private val act: MainActivity, private val screenWidthMm: Float
         floorY = if (lowest != Float.MAX_VALUE) lowest else gazeO[1] - 1.4f
 
         // Panel follows lazily.
-        if (recenterRequest || !panelPlaced || horizontalAngle(gazeF, panelDir) > 60f) {
-            placePanel(); recenterRequest = false
+        val away = horizontalAngle(gazeF, panelDir) > 75f
+        if (!away) awaySince = 0L else if (awaySince == 0L) awaySince = now
+        if (recenterRequest || !panelPlaced || (awaySince != 0L && now - awaySince > 1500)) {
+            placePanel(); recenterRequest = false; awaySince = 0L
         }
-        hovered = gazeButton()
+        val hv = gazeButton()
+        if (hv != hovered) { hovered = hv; hoverStart = now; dwellDone = false }
+        // Dwell click: look at a button for 1 s.
+        dwell = if (hovered >= 0 && !dwellDone) ((now - hoverStart) / DWELL_MS.toFloat()).coerceIn(0f, 1f) else 0f
+        if (hovered >= 0 && !dwellDone && now - hoverStart >= DWELL_MS) { pressButton(hovered); dwellDone = true }
 
         // Hands.
         val hd = hands.latest
@@ -380,6 +392,7 @@ class VrRenderer(private val act: MainActivity, private val screenWidthMm: Float
     }
 
     private fun pressButton(i: Int) {
+        dwellDone = true
         when (i) {
             0 -> mode = if (mode == Mode.CUBES) Mode.PAINT else Mode.CUBES
             1 -> passthrough = !passthrough
@@ -460,9 +473,9 @@ class VrRenderer(private val act: MainActivity, private val screenWidthMm: Float
         if (l < 1e-3f) { fx = 0f; fz = -1f } else { fx /= l; fz /= l }
         panelDir[0] = fx; panelDir[1] = 0f; panelDir[2] = fz
         panelRight[0] = -fz; panelRight[1] = 0f; panelRight[2] = fx
-        panelPos[0] = gazeO[0] + fx * 0.9f
-        panelPos[1] = gazeO[1] - 0.25f
-        panelPos[2] = gazeO[2] + fz * 0.9f
+        panelPos[0] = gazeO[0] + fx * 0.8f
+        panelPos[1] = gazeO[1] - 0.12f
+        panelPos[2] = gazeO[2] + fz * 0.8f
         panelPlaced = true
     }
 
@@ -486,7 +499,7 @@ class VrRenderer(private val act: MainActivity, private val screenWidthMm: Float
         val hz = gazeO[2] + gazeF[2] * t - panelPos[2]
         val lx = hx * panelRight[0] + hz * panelRight[2]
         for (i in 0 until 4) {
-            if (abs(lx - btnX[i]) <= btnW * 0.5f && abs(hy) <= btnH * 0.5f) return i
+            if (abs(lx - btnX[i]) <= btnW * 0.5f && abs(hy - btnY[i]) <= btnH * 0.5f) return i
         }
         return -1
     }
@@ -584,7 +597,7 @@ class VrRenderer(private val act: MainActivity, private val screenWidthMm: Float
         pointBuf.put(gazeO[0] + gazeF[0]); pointBuf.put(gazeO[1] + gazeF[1]); pointBuf.put(gazeO[2] + gazeF[2])
         pointBuf.position(0)
         val rc = if (hovered >= 0) RET_HOVER else if (handVisible) RET_HAND else RET_IDLE
-        drawColor(identity, pointBuf, null, GLES20.GL_POINTS, 1, rc, pointScale = 0.012f * pxPerMeter, round = true)
+        drawColor(identity, pointBuf, null, GLES20.GL_POINTS, 1, rc, pointScale = (0.012f + 0.03f * dwell) * pxPerMeter, round = true)
         GLES20.glDisable(GLES20.GL_BLEND)
     }
 
@@ -641,7 +654,7 @@ class VrRenderer(private val act: MainActivity, private val screenWidthMm: Float
             model[5] = btnH
             model[8] = -panelDir[0]; model[10] = -panelDir[2]
             model[12] = panelPos[0] + panelRight[0] * btnX[i]
-            model[13] = panelPos[1]
+            model[13] = panelPos[1] + btnY[i]
             model[14] = panelPos[2] + panelRight[2] * btnX[i]
             model[15] = 1f
             Matrix.multiplyMM(mvp, 0, vp, 0, model, 0)
@@ -777,6 +790,7 @@ class VrRenderer(private val act: MainActivity, private val screenWidthMm: Float
 
     companion object {
         private const val TAG = "VRClaude"
+        private const val DWELL_MS = 1000L
         private val FLOOR = floatArrayOf(0.85f, 0.87f, 0.9f, 1f)
         private val PLANE_PT = floatArrayOf(0.6f, 0.85f, 1f, 0.18f)
         private val PLANE_VR = floatArrayOf(0.3f, 0.6f, 1f, 0.25f)

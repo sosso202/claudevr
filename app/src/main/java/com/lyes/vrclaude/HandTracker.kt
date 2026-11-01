@@ -212,6 +212,11 @@ class HandTracker(context: Context) {
 
         val ratio = d2(4, 8) / max(palm, length * 0.75f)
         pinchState = if (pinchState) ratio < 0.5f else ratio < 0.3f
+        // Smooth jitter against the last result when it is recent.
+        val prev = latest
+        if (prev != null && SystemClock.elapsedRealtime() - prev.time < 250) {
+            for (k in 0 until 21) for (c in 0..2) pts[k][c] = prev.points[k][c] + (pts[k][c] - prev.points[k][c]) * 0.6f
+        }
         val pinch = FloatArray(3) { (pts[4][it] + pts[8][it]) * 0.5f }
         latest = Hand(SystemClock.elapsedRealtime(), pts, pinchState, pinch)
     }
