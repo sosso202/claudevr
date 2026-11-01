@@ -7,6 +7,9 @@ on:
 permissions:
   contents: write
 
+env:
+  CARDBOARD_COMMIT: 8bd424da7f1e399255a1b6e7c02be8e281ecc974
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -18,6 +21,27 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Get Cardboard SDK source
+        run: |
+          mkdir cardboard && cd cardboard
+          git init -q
+          git remote add origin https://github.com/googlevr/cardboard.git
+          git fetch -q --depth 1 origin $CARDBOARD_COMMIT
+          git checkout -q FETCH_HEAD
+
+      - name: Build Cardboard SDK (AAR)
+        working-directory: cardboard
+        run: |
+          echo "include ':sdk'" > settings.gradle
+          chmod +x gradlew
+          ./gradlew :sdk:assembleDebug --no-daemon --stacktrace
+
+      - name: Hand the SDK to the app
+        run: |
+          mkdir -p app/libs
+          cp cardboard/sdk/build/outputs/aar/sdk-debug.aar app/libs/cardboard-sdk.aar
+          unzip -q -o app/libs/cardboard-sdk.aar "jni/*" -d app/libs
+
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
@@ -28,7 +52,7 @@ jobs:
           curl -fL -o app/src/main/assets/hand_landmarker.task \
             https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
 
-      - name: Build
+      - name: Build app
         run: gradle assembleDebug --no-daemon --stacktrace
 
       - name: Rename APK
